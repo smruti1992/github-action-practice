@@ -1,5 +1,6 @@
 ---
 - name: Run a script on target server
+  host: kube_hosts
   become_user: root
   become: yes
   tasks:
