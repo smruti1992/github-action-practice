@@ -1,0 +1,7 @@
+---
+- name: Run a script on target server
+  become_user: root
+  become: yes
+  tasks:
+    - name: run script
+      shell: /root/check.ksh
