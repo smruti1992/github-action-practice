@@ -1,0 +1,12 @@
+# ansible/inventory/dev/hosts
+# Replace the placeholder IP with your actual dev server IP.
+# In the GitHub Actions workflow the inventory is passed inline via --inventory,
+# so this file is used when running Ansible locally.
+
+[dev]
+dev-server ansible_host=<DEV_SERVER_IP> ansible_user=<DEPLOY_USER> ansible_ssh_private_key_file=~/.ssh/id_rsa
+
+[dev:vars]
+env_name=dev
+tomcat_home=/opt/tomcat
+tomcat_service=tomcat

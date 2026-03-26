@@ -1,0 +1,8 @@
+---
+# defaults/main.yml — tomcat-deploy role
+tomcat_home:    /opt/tomcat
+tomcat_webapps: "{{ tomcat_home }}/webapps"
+tomcat_service: tomcat
+app_name:       webapp
+jfrog_repo:     libs-release-local
+backup_dir:     /opt/tomcat/war-backups

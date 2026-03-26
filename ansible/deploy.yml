@@ -1,0 +1,32 @@
+---
+# =============================================================================
+# deploy.yml — Deploy WAR to Apache Tomcat
+# =============================================================================
+# Variables (pass via --extra-vars or group_vars):
+#   app_war_name   : WAR filename, e.g. webapp-1.0.0-42.war
+#   app_version    : Semver+build, e.g. 1.0.0-42
+#   jfrog_url      : Base URL of JFrog Artifactory instance
+#   jfrog_username : Artifactory username
+#   jfrog_password : Artifactory API key
+#   env_name       : dev | staging | prod
+# =============================================================================
+
+- name: Deploy WAR to Apache Tomcat
+  hosts: all
+  become: yes
+  become_user: root
+
+  vars:
+    tomcat_home:    /opt/tomcat
+    tomcat_webapps: "{{ tomcat_home }}/webapps"
+    tomcat_service: tomcat
+    app_name:       webapp
+    jfrog_repo:     libs-release-local
+    backup_dir:     /opt/tomcat/war-backups
+    # Derived
+    war_local_path: "/tmp/{{ app_war_name }}"
+    jfrog_artifact_url: >-
+      {{ jfrog_url }}/artifactory/{{ jfrog_repo }}/{{ app_name }}/{{ app_version }}/{{ app_war_name }}
+
+  roles:
+    - tomcat-deploy
