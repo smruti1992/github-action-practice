@@ -1,0 +1,22 @@
+---
+# =============================================================================
+# rollback.yml — Roll back to the previous successful WAR deployment
+# =============================================================================
+# Variables:
+#   env_name : dev | staging | prod
+# =============================================================================
+
+- name: Roll back to previous WAR on Apache Tomcat
+  hosts: all
+  become: yes
+  become_user: root
+
+  vars:
+    tomcat_home:    /opt/tomcat
+    tomcat_webapps: "{{ tomcat_home }}/webapps"
+    tomcat_service: tomcat
+    app_name:       webapp
+    backup_dir:     /opt/tomcat/war-backups
+
+  roles:
+    - tomcat-rollback

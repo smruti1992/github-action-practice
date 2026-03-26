@@ -1,0 +1,65 @@
+---
+# tasks/main.yml — tomcat-rollback role
+
+- name: Find the most recent backup WAR
+  find:
+    paths: "{{ backup_dir }}"
+    patterns: "{{ app_name }}-*.war"
+    file_type: file
+  register: backup_files
+  changed_when: false
+
+- name: Set latest backup path
+  set_fact:
+    latest_backup_path: >-
+      {{ (backup_files.files | sort(attribute='mtime') | last).path
+         if backup_files.files | length > 0 else '' }}
+
+- name: Fail if no backup WAR is available
+  fail:
+    msg: "No backup WAR found in {{ backup_dir }}. Cannot rollback."
+  when: latest_backup_path == ''
+
+- name: Stop Tomcat before rolling back
+  service:
+    name: "{{ tomcat_service }}"
+    state: stopped
+
+- name: Remove failed WAR and exploded directory
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ tomcat_webapps }}/{{ app_name }}.war"
+    - "{{ tomcat_webapps }}/{{ app_name }}"
+
+- name: Restore previous WAR from backup
+  copy:
+    src: "{{ latest_backup_path }}"
+    dest: "{{ tomcat_webapps }}/{{ app_name }}.war"
+    owner: tomcat
+    group: tomcat
+    mode: '0644'
+    remote_src: yes
+
+- name: Start Tomcat after rollback
+  service:
+    name: "{{ tomcat_service }}"
+    state: started
+
+- name: Wait for Tomcat to start on port 8080
+  wait_for:
+    port: 8080
+    host: 127.0.0.1
+    delay: 5
+    timeout: 60
+    state: started
+
+- name: Log rollback action
+  lineinfile:
+    path: "{{ backup_dir }}/rollback.log"
+    line: "{{ ansible_date_time.iso8601 }} — rolled back to {{ latest_backup_path | basename }}"
+    create: yes
+    owner: tomcat
+    group: tomcat
+    mode: '0644'

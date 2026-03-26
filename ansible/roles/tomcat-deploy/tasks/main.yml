@@ -1,0 +1,84 @@
+---
+# tasks/main.yml — tomcat-deploy role
+
+- name: Ensure backup directory exists
+  file:
+    path: "{{ backup_dir }}"
+    state: directory
+    owner: tomcat
+    group: tomcat
+    mode: '0755'
+
+- name: Backup current WAR (if present) before deploying new version
+  block:
+    - name: Check if existing WAR is deployed
+      stat:
+        path: "{{ tomcat_webapps }}/{{ app_name }}.war"
+      register: current_war
+
+    - name: Copy current WAR to backup directory with timestamp
+      copy:
+        src: "{{ tomcat_webapps }}/{{ app_name }}.war"
+        dest: "{{ backup_dir }}/{{ app_name }}-{{ ansible_date_time.iso8601_basic_short }}.war"
+        remote_src: yes
+      when: current_war.stat.exists
+
+    - name: Keep only the last 5 backups
+      shell: |
+        FILES=$(ls -1t {{ backup_dir }}/{{ app_name }}-*.war 2>/dev/null | tail -n +6)
+        [ -n "$FILES" ] && echo "$FILES" | xargs rm -f || true
+      args:
+        executable: /bin/bash
+      when: current_war.stat.exists
+
+- name: Download WAR from JFrog Artifactory
+  get_url:
+    url: "{{ jfrog_artifact_url }}"
+    dest: "{{ war_local_path }}"
+    url_username: "{{ jfrog_username }}"
+    url_password: "{{ jfrog_password }}"
+    force_basic_auth: yes
+    mode: '0644'
+
+- name: Stop Tomcat before replacing WAR
+  service:
+    name: "{{ tomcat_service }}"
+    state: stopped
+
+- name: Remove old exploded webapp directory (if present)
+  file:
+    path: "{{ tomcat_webapps }}/{{ app_name }}"
+    state: absent
+
+- name: Remove old WAR file
+  file:
+    path: "{{ tomcat_webapps }}/{{ app_name }}.war"
+    state: absent
+
+- name: Deploy new WAR to Tomcat webapps directory
+  copy:
+    src: "{{ war_local_path }}"
+    dest: "{{ tomcat_webapps }}/{{ app_name }}.war"
+    owner: tomcat
+    group: tomcat
+    mode: '0644'
+    remote_src: yes
+
+- name: Start Tomcat
+  service:
+    name: "{{ tomcat_service }}"
+    state: started
+  notify: wait for tomcat
+
+- name: Clean up temporary WAR file
+  file:
+    path: "{{ war_local_path }}"
+    state: absent
+
+- name: Record deployed version
+  copy:
+    content: "{{ app_version }}\n"
+    dest: "{{ backup_dir }}/current_version.txt"
+    owner: tomcat
+    group: tomcat
+    mode: '0644'

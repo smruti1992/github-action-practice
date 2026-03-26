@@ -1,0 +1,453 @@
+# =============================================================================
+# CI/CD Pipeline — Java Web Application
+# =============================================================================
+# Stages:
+#   1. build        – compile, test, produce WAR
+#   2. sonarqube    – static analysis + quality gate
+#   3. publish      – upload WAR to JFrog Artifactory
+#   4. deploy-dev   – Ansible deploy to dev environment
+#   5. deploy-staging – Ansible deploy to staging (manual approval)
+#   6. deploy-prod  – Ansible deploy to production (manual approval)
+#   7. notify       – Slack notification on success or failure
+#
+# Required GitHub Secrets:
+#   SONAR_HOST_URL      – e.g. http://sonarqube.example.com:9000
+#   SONAR_TOKEN         – SonarQube user token
+#   JFROG_URL           – e.g. https://mycompany.jfrog.io/mycompany
+#   JFROG_USERNAME      – Artifactory username
+#   JFROG_PASSWORD      – Artifactory API key or password
+#   SSH_PRIVATE_KEY     – Private key for Ansible SSH access
+#   DEPLOY_USER         – OS user on the target servers
+#   DEV_SERVER_IP       – IP / hostname of the dev target
+#   STAGING_SERVER_IP   – IP / hostname of the staging target
+#   PROD_SERVER_IP      – IP / hostname of the prod target
+#   SLACK_WEBHOOK_URL   – Incoming webhook URL (optional)
+# =============================================================================
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'release/**'
+  pull_request:
+    branches:
+      - main
+      - develop
+
+env:
+  APP_NAME: webapp
+  APP_VERSION_BASE: "1.0.0"
+  JAVA_VERSION: "11"
+  JFROG_REPO: libs-release-local
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. BUILD
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    outputs:
+      war_name: ${{ steps.set-outputs.outputs.war_name }}
+      full_version: ${{ steps.set-outputs.outputs.full_version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history needed by SonarQube
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Compute version
+        id: version
+        run: |
+          FULL_VERSION="${APP_VERSION_BASE}-${{ github.run_number }}"
+          echo "FULL_VERSION=$FULL_VERSION" >> "$GITHUB_ENV"
+          echo "full_version=$FULL_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build with Maven (compile + test + package)
+        run: |
+          mvn --batch-mode clean verify \
+            -Dbuild.number=${{ github.run_number }}
+
+      - name: Set artifact output variables
+        id: set-outputs
+        run: |
+          WAR_NAME="${APP_NAME}-${FULL_VERSION}.war"
+          echo "war_name=$WAR_NAME"    >> "$GITHUB_OUTPUT"
+          echo "full_version=$FULL_VERSION" >> "$GITHUB_OUTPUT"
+          # Rename the WAR to include the versioned name for upload
+          cp "target/${APP_NAME}-${FULL_VERSION}.war" "target/${WAR_NAME}" 2>/dev/null || true
+
+      - name: Upload WAR artifact (inter-job)
+        uses: actions/upload-artifact@v4
+        with:
+          name: war-artifact
+          path: target/*.war
+          retention-days: 7
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: target/surefire-reports/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 2. SONARQUBE SCAN
+  # ---------------------------------------------------------------------------
+  sonarqube:
+    name: SonarQube Analysis
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+    # Skip on PRs from forks where secrets are unavailable
+    if: |
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Restore compiled classes
+        # Re-compile (compile only, no tests) so SonarQube can read bytecode.
+        # This avoids downloading the WAR and unpacking it.
+        run: mvn --batch-mode compile test-compile -Dbuild.number=${{ github.run_number }}
+
+      - name: Run SonarQube scan
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_TOKEN:    ${{ secrets.SONAR_TOKEN }}
+        run: |
+          mvn --batch-mode sonar:sonar \
+            -Dbuild.number=${{ github.run_number }} \
+            -Dsonar.host.url="${SONAR_HOST_URL}" \
+            -Dsonar.login="${SONAR_TOKEN}" \
+            -Dsonar.qualitygate.wait=true
+
+  # ---------------------------------------------------------------------------
+  # 3. PUBLISH TO JFROG ARTIFACTORY
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish to JFrog Artifactory
+    runs-on: ubuntu-latest
+    needs: [build, sonarqube]
+    permissions: {}
+    # Only publish from main or release branches (not PRs)
+    if: |
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+
+    steps:
+      - name: Download WAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: war-artifact
+          path: target/
+
+      - name: Upload WAR to Artifactory
+        env:
+          JFROG_URL:      ${{ secrets.JFROG_URL }}
+          JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
+          JFROG_PASSWORD: ${{ secrets.JFROG_PASSWORD }}
+          WAR_NAME:       ${{ needs.build.outputs.war_name }}
+          FULL_VERSION:   ${{ needs.build.outputs.full_version }}
+        run: |
+          ARTIFACT_PATH="${JFROG_REPO}/${APP_NAME}/${FULL_VERSION}/${WAR_NAME}"
+          curl --fail \
+               --user "${JFROG_USERNAME}:${JFROG_PASSWORD}" \
+               --upload-file "target/${WAR_NAME}" \
+               "${JFROG_URL}/artifactory/${ARTIFACT_PATH}"
+          echo "Artifact published: ${JFROG_URL}/artifactory/${ARTIFACT_PATH}"
+
+  # ---------------------------------------------------------------------------
+  # 4. DEPLOY TO DEV
+  # ---------------------------------------------------------------------------
+  deploy-dev:
+    name: Deploy to Dev
+    runs-on: ubuntu-latest
+    needs: [build, publish]
+    environment: dev
+    permissions:
+      contents: read
+    if: |
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' ||
+       startsWith(github.ref, 'refs/heads/release/'))
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download WAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: war-artifact
+          path: target/
+
+      - name: Setup SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Add target to known_hosts
+        env:
+          DEV_SERVER_IP: ${{ secrets.DEV_SERVER_IP }}
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${DEV_SERVER_IP}" >> ~/.ssh/known_hosts
+
+      - name: Install Ansible
+        run: |
+          pip install --quiet "ansible>=2.14,<3"
+
+      - name: Run Ansible deployment playbook (dev)
+        env:
+          DEV_SERVER_IP:  ${{ secrets.DEV_SERVER_IP }}
+          DEPLOY_USER:    ${{ secrets.DEPLOY_USER }}
+          WAR_NAME:       ${{ needs.build.outputs.war_name }}
+          FULL_VERSION:   ${{ needs.build.outputs.full_version }}
+          JFROG_URL:      ${{ secrets.JFROG_URL }}
+          JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
+          JFROG_PASSWORD: ${{ secrets.JFROG_PASSWORD }}
+        run: |
+          ansible-playbook ansible/deploy.yml \
+            --inventory "${DEV_SERVER_IP}," \
+            --user "${DEPLOY_USER}" \
+            --extra-vars "app_war_name=${WAR_NAME} \
+                          app_version=${FULL_VERSION} \
+                          jfrog_url=${JFROG_URL} \
+                          jfrog_username=${JFROG_USERNAME} \
+                          jfrog_password=${JFROG_PASSWORD} \
+                          env_name=dev" \
+            -v
+
+      - name: Rollback on failure
+        if: failure()
+        env:
+          DEV_SERVER_IP: ${{ secrets.DEV_SERVER_IP }}
+          DEPLOY_USER:   ${{ secrets.DEPLOY_USER }}
+        run: |
+          ansible-playbook ansible/rollback.yml \
+            --inventory "${DEV_SERVER_IP}," \
+            --user "${DEPLOY_USER}" \
+            --extra-vars "env_name=dev" \
+            -v
+
+  # ---------------------------------------------------------------------------
+  # 5. DEPLOY TO STAGING (requires manual approval via environment protection)
+  # ---------------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build, deploy-dev]
+    environment: staging          # configure "Required reviewers" in GitHub UI
+    permissions:
+      contents: read
+    if: |
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download WAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: war-artifact
+          path: target/
+
+      - name: Setup SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Add target to known_hosts
+        env:
+          STAGING_SERVER_IP: ${{ secrets.STAGING_SERVER_IP }}
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${STAGING_SERVER_IP}" >> ~/.ssh/known_hosts
+
+      - name: Install Ansible
+        run: pip install --quiet "ansible>=2.14,<3"
+
+      - name: Run Ansible deployment playbook (staging)
+        env:
+          STAGING_SERVER_IP: ${{ secrets.STAGING_SERVER_IP }}
+          DEPLOY_USER:       ${{ secrets.DEPLOY_USER }}
+          WAR_NAME:          ${{ needs.build.outputs.war_name }}
+          FULL_VERSION:      ${{ needs.build.outputs.full_version }}
+          JFROG_URL:         ${{ secrets.JFROG_URL }}
+          JFROG_USERNAME:    ${{ secrets.JFROG_USERNAME }}
+          JFROG_PASSWORD:    ${{ secrets.JFROG_PASSWORD }}
+        run: |
+          ansible-playbook ansible/deploy.yml \
+            --inventory "${STAGING_SERVER_IP}," \
+            --user "${DEPLOY_USER}" \
+            --extra-vars "app_war_name=${WAR_NAME} \
+                          app_version=${FULL_VERSION} \
+                          jfrog_url=${JFROG_URL} \
+                          jfrog_username=${JFROG_USERNAME} \
+                          jfrog_password=${JFROG_PASSWORD} \
+                          env_name=staging" \
+            -v
+
+      - name: Rollback on failure
+        if: failure()
+        env:
+          STAGING_SERVER_IP: ${{ secrets.STAGING_SERVER_IP }}
+          DEPLOY_USER:       ${{ secrets.DEPLOY_USER }}
+        run: |
+          ansible-playbook ansible/rollback.yml \
+            --inventory "${STAGING_SERVER_IP}," \
+            --user "${DEPLOY_USER}" \
+            --extra-vars "env_name=staging" \
+            -v
+
+  # ---------------------------------------------------------------------------
+  # 6. DEPLOY TO PRODUCTION (requires manual approval via environment protection)
+  # ---------------------------------------------------------------------------
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build, deploy-staging]
+    environment: prod             # configure "Required reviewers" in GitHub UI
+    permissions:
+      contents: read
+    if: |
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download WAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: war-artifact
+          path: target/
+
+      - name: Setup SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Add target to known_hosts
+        env:
+          PROD_SERVER_IP: ${{ secrets.PROD_SERVER_IP }}
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${PROD_SERVER_IP}" >> ~/.ssh/known_hosts
+
+      - name: Install Ansible
+        run: pip install --quiet "ansible>=2.14,<3"
+
+      - name: Run Ansible deployment playbook (prod)
+        env:
+          PROD_SERVER_IP: ${{ secrets.PROD_SERVER_IP }}
+          DEPLOY_USER:    ${{ secrets.DEPLOY_USER }}
+          WAR_NAME:       ${{ needs.build.outputs.war_name }}
+          FULL_VERSION:   ${{ needs.build.outputs.full_version }}
+          JFROG_URL:      ${{ secrets.JFROG_URL }}
+          JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
+          JFROG_PASSWORD: ${{ secrets.JFROG_PASSWORD }}
+        run: |
+          ansible-playbook ansible/deploy.yml \
+            --inventory "${PROD_SERVER_IP}," \
+            --user "${DEPLOY_USER}" \
+            --extra-vars "app_war_name=${WAR_NAME} \
+                          app_version=${FULL_VERSION} \
+                          jfrog_url=${JFROG_URL} \
+                          jfrog_username=${JFROG_USERNAME} \
+                          jfrog_password=${JFROG_PASSWORD} \
+                          env_name=prod" \
+            -v
+
+      - name: Rollback on failure
+        if: failure()
+        env:
+          PROD_SERVER_IP: ${{ secrets.PROD_SERVER_IP }}
+          DEPLOY_USER:    ${{ secrets.DEPLOY_USER }}
+        run: |
+          ansible-playbook ansible/rollback.yml \
+            --inventory "${PROD_SERVER_IP}," \
+            --user "${DEPLOY_USER}" \
+            --extra-vars "env_name=prod" \
+            -v
+
+  # ---------------------------------------------------------------------------
+  # 7. SLACK NOTIFICATION
+  # ---------------------------------------------------------------------------
+  notify:
+    name: Slack Notification
+    runs-on: ubuntu-latest
+    needs: [deploy-dev, deploy-staging, deploy-prod]
+    permissions: {}
+    if: always()
+
+    steps:
+      - name: Determine overall status
+        id: status
+        run: |
+          DEPLOY_DEV="${{ needs.deploy-dev.result }}"
+          DEPLOY_STAGING="${{ needs.deploy-staging.result }}"
+          DEPLOY_PROD="${{ needs.deploy-prod.result }}"
+
+          if [[ "$DEPLOY_DEV" == "failure" || "$DEPLOY_STAGING" == "failure" || "$DEPLOY_PROD" == "failure" ]]; then
+            echo "color=danger"  >> "$GITHUB_OUTPUT"
+            echo "status=FAILED" >> "$GITHUB_OUTPUT"
+          elif [[ "$DEPLOY_DEV" == "success" || "$DEPLOY_STAGING" == "success" || "$DEPLOY_PROD" == "success" ]]; then
+            echo "color=good"    >> "$GITHUB_OUTPUT"
+            echo "status=PASSED" >> "$GITHUB_OUTPUT"
+          else
+            echo "color=warning"  >> "$GITHUB_OUTPUT"
+            echo "status=SKIPPED" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Send Slack notification
+        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl --fail -X POST "${SLACK_WEBHOOK_URL}" \
+          -H 'Content-Type: application/json' \
+          -d '{
+            "attachments": [{
+              "color": "${{ steps.status.outputs.color }}",
+              "title": "CI/CD Pipeline ${{ steps.status.outputs.status }}",
+              "fields": [
+                {"title":"Repository","value":"${{ github.repository }}","short":true},
+                {"title":"Branch","value":"${{ github.ref_name }}","short":true},
+                {"title":"Commit","value":"${{ github.sha }}","short":true},
+                {"title":"Triggered by","value":"${{ github.actor }}","short":true},
+                {"title":"Run","value":"<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|#${{ github.run_number }}>","short":true}
+              ]
+            }]
+          }'
