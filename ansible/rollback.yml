@@ -3,7 +3,7 @@
 # rollback.yml — Roll back to the previous successful WAR deployment
 # =============================================================================
 # Variables:
-#   env_name : dev | staging | prod
+#   env_name : test | prod
 # =============================================================================
 
 - name: Roll back to previous WAR on Apache Tomcat

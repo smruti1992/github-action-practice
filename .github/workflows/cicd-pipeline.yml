@@ -5,10 +5,14 @@
 #   1. build        – compile, test, produce WAR
 #   2. sonarqube    – static analysis + quality gate
 #   3. publish      – upload WAR to JFrog Artifactory
-#   4. deploy-dev   – Ansible deploy to dev environment
-#   5. deploy-staging – Ansible deploy to staging (manual approval)
-#   6. deploy-prod  – Ansible deploy to production (manual approval)
-#   7. notify       – Slack notification on success or failure
+#   4. deploy-test  – Ansible deploy to test environment  (workflow_dispatch)
+#   5. deploy-prod  – Ansible deploy to production        (workflow_dispatch, manual approval)
+#   6. notify       – Slack notification on success or failure
+#
+# Trigger:
+#   • Push / PR  → runs build, sonarqube, publish (CI only)
+#   • workflow_dispatch with `environment` input (test | prod)
+#       → runs full pipeline including the matching deploy job
 #
 # Required GitHub Secrets:
 #   SONAR_HOST_URL      – e.g. http://sonarqube.example.com:9000
@@ -18,8 +22,7 @@
 #   JFROG_PASSWORD      – Artifactory API key or password
 #   SSH_PRIVATE_KEY     – Private key for Ansible SSH access
 #   DEPLOY_USER         – OS user on the target servers
-#   DEV_SERVER_IP       – IP / hostname of the dev target
-#   STAGING_SERVER_IP   – IP / hostname of the staging target
+#   TEST_SERVER_IP      – IP / hostname of the test target
 #   PROD_SERVER_IP      – IP / hostname of the prod target
 #   SLACK_WEBHOOK_URL   – Incoming webhook URL (optional)
 # =============================================================================
@@ -36,6 +39,16 @@ on:
     branches:
       - main
       - develop
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment to deploy to'
+        required: true
+        default: test
+        type: choice
+        options:
+          - test
+          - prod
 
 env:
   APP_NAME: webapp
@@ -157,10 +170,11 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build, sonarqube]
     permissions: {}
-    # Only publish from main or release branches (not PRs)
+    # Publish from main/release branch pushes and all manual dispatches
     if: |
-      github.event_name == 'push' &&
-      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+      (github.event_name == 'push' &&
+       (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))) ||
+      github.event_name == 'workflow_dispatch'
 
     steps:
       - name: Download WAR artifact
@@ -185,19 +199,16 @@ jobs:
           echo "Artifact published: ${JFROG_URL}/artifactory/${ARTIFACT_PATH}"
 
   # ---------------------------------------------------------------------------
-  # 4. DEPLOY TO DEV
+  # 4. DEPLOY TO TEST (workflow_dispatch only, environment == test)
   # ---------------------------------------------------------------------------
-  deploy-dev:
-    name: Deploy to Dev
+  deploy-test:
+    name: Deploy to Test
     runs-on: ubuntu-latest
     needs: [build, publish]
-    environment: dev
+    environment: test
     permissions:
       contents: read
-    if: |
-      github.event_name == 'push' &&
-      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' ||
-       startsWith(github.ref, 'refs/heads/release/'))
+    if: github.event_name == 'workflow_dispatch' && inputs.environment == 'test'
 
     steps:
       - name: Checkout code
@@ -216,18 +227,18 @@ jobs:
 
       - name: Add target to known_hosts
         env:
-          DEV_SERVER_IP: ${{ secrets.DEV_SERVER_IP }}
+          TEST_SERVER_IP: ${{ secrets.TEST_SERVER_IP }}
         run: |
           mkdir -p ~/.ssh
-          ssh-keyscan -H "${DEV_SERVER_IP}" >> ~/.ssh/known_hosts
+          ssh-keyscan -H "${TEST_SERVER_IP}" >> ~/.ssh/known_hosts
 
       - name: Install Ansible
         run: |
           pip install --quiet "ansible>=2.14,<3"
 
-      - name: Run Ansible deployment playbook (dev)
+      - name: Run Ansible deployment playbook (test)
         env:
-          DEV_SERVER_IP:  ${{ secrets.DEV_SERVER_IP }}
+          TEST_SERVER_IP: ${{ secrets.TEST_SERVER_IP }}
           DEPLOY_USER:    ${{ secrets.DEPLOY_USER }}
           WAR_NAME:       ${{ needs.build.outputs.war_name }}
           FULL_VERSION:   ${{ needs.build.outputs.full_version }}
@@ -236,113 +247,39 @@ jobs:
           JFROG_PASSWORD: ${{ secrets.JFROG_PASSWORD }}
         run: |
           ansible-playbook ansible/deploy.yml \
-            --inventory "${DEV_SERVER_IP}," \
+            --inventory "${TEST_SERVER_IP}," \
             --user "${DEPLOY_USER}" \
             --extra-vars "app_war_name=${WAR_NAME} \
                           app_version=${FULL_VERSION} \
                           jfrog_url=${JFROG_URL} \
                           jfrog_username=${JFROG_USERNAME} \
                           jfrog_password=${JFROG_PASSWORD} \
-                          env_name=dev" \
+                          env_name=test" \
             -v
 
       - name: Rollback on failure
         if: failure()
         env:
-          DEV_SERVER_IP: ${{ secrets.DEV_SERVER_IP }}
-          DEPLOY_USER:   ${{ secrets.DEPLOY_USER }}
+          TEST_SERVER_IP: ${{ secrets.TEST_SERVER_IP }}
+          DEPLOY_USER:    ${{ secrets.DEPLOY_USER }}
         run: |
           ansible-playbook ansible/rollback.yml \
-            --inventory "${DEV_SERVER_IP}," \
+            --inventory "${TEST_SERVER_IP}," \
             --user "${DEPLOY_USER}" \
-            --extra-vars "env_name=dev" \
+            --extra-vars "env_name=test" \
             -v
 
   # ---------------------------------------------------------------------------
-  # 5. DEPLOY TO STAGING (requires manual approval via environment protection)
-  # ---------------------------------------------------------------------------
-  deploy-staging:
-    name: Deploy to Staging
-    runs-on: ubuntu-latest
-    needs: [build, deploy-dev]
-    environment: staging          # configure "Required reviewers" in GitHub UI
-    permissions:
-      contents: read
-    if: |
-      github.event_name == 'push' &&
-      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download WAR artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: war-artifact
-          path: target/
-
-      - name: Setup SSH key
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
-
-      - name: Add target to known_hosts
-        env:
-          STAGING_SERVER_IP: ${{ secrets.STAGING_SERVER_IP }}
-        run: |
-          mkdir -p ~/.ssh
-          ssh-keyscan -H "${STAGING_SERVER_IP}" >> ~/.ssh/known_hosts
-
-      - name: Install Ansible
-        run: pip install --quiet "ansible>=2.14,<3"
-
-      - name: Run Ansible deployment playbook (staging)
-        env:
-          STAGING_SERVER_IP: ${{ secrets.STAGING_SERVER_IP }}
-          DEPLOY_USER:       ${{ secrets.DEPLOY_USER }}
-          WAR_NAME:          ${{ needs.build.outputs.war_name }}
-          FULL_VERSION:      ${{ needs.build.outputs.full_version }}
-          JFROG_URL:         ${{ secrets.JFROG_URL }}
-          JFROG_USERNAME:    ${{ secrets.JFROG_USERNAME }}
-          JFROG_PASSWORD:    ${{ secrets.JFROG_PASSWORD }}
-        run: |
-          ansible-playbook ansible/deploy.yml \
-            --inventory "${STAGING_SERVER_IP}," \
-            --user "${DEPLOY_USER}" \
-            --extra-vars "app_war_name=${WAR_NAME} \
-                          app_version=${FULL_VERSION} \
-                          jfrog_url=${JFROG_URL} \
-                          jfrog_username=${JFROG_USERNAME} \
-                          jfrog_password=${JFROG_PASSWORD} \
-                          env_name=staging" \
-            -v
-
-      - name: Rollback on failure
-        if: failure()
-        env:
-          STAGING_SERVER_IP: ${{ secrets.STAGING_SERVER_IP }}
-          DEPLOY_USER:       ${{ secrets.DEPLOY_USER }}
-        run: |
-          ansible-playbook ansible/rollback.yml \
-            --inventory "${STAGING_SERVER_IP}," \
-            --user "${DEPLOY_USER}" \
-            --extra-vars "env_name=staging" \
-            -v
-
-  # ---------------------------------------------------------------------------
-  # 6. DEPLOY TO PRODUCTION (requires manual approval via environment protection)
+  # 5. DEPLOY TO PRODUCTION (workflow_dispatch only, environment == prod, manual approval)
   # ---------------------------------------------------------------------------
   deploy-prod:
     name: Deploy to Production
     runs-on: ubuntu-latest
-    needs: [build, deploy-staging]
+    needs: [build, publish]
     environment: prod             # configure "Required reviewers" in GitHub UI
     permissions:
       contents: read
-    if: |
-      github.event_name == 'push' &&
-      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+    if: github.event_name == 'workflow_dispatch' && inputs.environment == 'prod'
 
     steps:
       - name: Checkout code
@@ -403,12 +340,12 @@ jobs:
             -v
 
   # ---------------------------------------------------------------------------
-  # 7. SLACK NOTIFICATION
+  # 6. SLACK NOTIFICATION
   # ---------------------------------------------------------------------------
   notify:
     name: Slack Notification
     runs-on: ubuntu-latest
-    needs: [deploy-dev, deploy-staging, deploy-prod]
+    needs: [deploy-test, deploy-prod]
     permissions: {}
     if: always()
 
@@ -416,14 +353,13 @@ jobs:
       - name: Determine overall status
         id: status
         run: |
-          DEPLOY_DEV="${{ needs.deploy-dev.result }}"
-          DEPLOY_STAGING="${{ needs.deploy-staging.result }}"
+          DEPLOY_TEST="${{ needs.deploy-test.result }}"
           DEPLOY_PROD="${{ needs.deploy-prod.result }}"
 
-          if [[ "$DEPLOY_DEV" == "failure" || "$DEPLOY_STAGING" == "failure" || "$DEPLOY_PROD" == "failure" ]]; then
+          if [[ "$DEPLOY_TEST" == "failure" || "$DEPLOY_PROD" == "failure" ]]; then
             echo "color=danger"  >> "$GITHUB_OUTPUT"
             echo "status=FAILED" >> "$GITHUB_OUTPUT"
-          elif [[ "$DEPLOY_DEV" == "success" || "$DEPLOY_STAGING" == "success" || "$DEPLOY_PROD" == "success" ]]; then
+          elif [[ "$DEPLOY_TEST" == "success" || "$DEPLOY_PROD" == "success" ]]; then
             echo "color=good"    >> "$GITHUB_OUTPUT"
             echo "status=PASSED" >> "$GITHUB_OUTPUT"
           else

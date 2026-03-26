@@ -8,7 +8,7 @@
 #   jfrog_url      : Base URL of JFrog Artifactory instance
 #   jfrog_username : Artifactory username
 #   jfrog_password : Artifactory API key
-#   env_name       : dev | staging | prod
+#   env_name       : test | prod
 # =============================================================================
 
 - name: Deploy WAR to Apache Tomcat
